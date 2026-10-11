@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
@@ -256,7 +257,9 @@ class DSparkAttention(MqaAttentionBase):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if _is_npu and forward_batch.forward_mode.is_idle():
+        # Idle ranks have no draft KV rows or attention metadata, but still
+        # participate in the shared MoE forward later in the draft stage.
+        if forward_batch.forward_mode.is_idle():
             return torch.zeros_like(hidden_states)
 
         from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -745,35 +748,31 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         forward_batch: ForwardBatch,
         prev_pre: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
+        # The draft stages run the plain four steps: no fused post, no seams, so
+        # they need nothing from `bind_next` and never hand anything forward.
+        assert self.attn_hc is not None and self.ffn_hc is not None
+        stats_stream = None
+        if mhc.use_stats_stream(self.hc_cfg, forward_batch, hidden_states):
+            stats_stream = self.hc_stats_stream
+
         residual = hidden_states
-        x = self._hc_combine(
-            hidden_states, prev_pre, self.input_layernorm, stats_stream
-        )
+        mhc.fork_stats_stream(stats_stream)
+        x = mhc.combine(self.attn_hc, mhc.HcState(hidden_states, prev_pre))
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(positions, x, forward_batch)
-        attn_pre, attn_post, attn_comb = self._hc_mix_stats(
-            hidden_states,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            stats_stream,
+        attn_pre, attn_post, attn_comb = mhc.mix_stats(
+            self.attn_hc, hidden_states, stats_stream
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
-        x = self._hc_combine(
-            hidden_states, attn_pre, self.post_attention_layernorm, stats_stream
-        )
+        mhc.fork_stats_stream(stats_stream)
+        x = mhc.combine(self.ffn_hc, mhc.HcState(hidden_states, attn_pre))
         x = self._run_ffn(x, forward_batch)
-        ffn_pre, ffn_post, ffn_comb = self._hc_mix_stats(
-            hidden_states,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            stats_stream,
+        ffn_pre, ffn_post, ffn_comb = mhc.mix_stats(
+            self.ffn_hc, hidden_states, stats_stream
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
